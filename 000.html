@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Hand-Tracked Particles with Trails</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #050505; font-family: sans-serif; }
+        #canvas-container { position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 1; }
+        #video-container {
+            position: absolute; bottom: 20px; left: 20px; z-index: 2;
+            width: 160px; height: 120px; border-radius: 10px; overflow: hidden;
+            border: 2px solid rgba(255, 255, 255, 0.3);
+            transform: scaleX(-1);
+        }
+        video { width: 100%; height: 100%; object-fit: cover; }
+        #ui {
+            position: absolute; top: 20px; left: 20px; z-index: 3;
+            color: white; pointer-events: none;
+        }
+        h1 { margin: 0; font-size: 1.5rem; text-shadow: 0 0 10px cyan; }
+        p { font-size: 0.9rem; opacity: 0.8; }
+        .status { color: #00ff88; font-weight: bold; }
+    </style>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+</head>
+<body>
+
+    <div id="ui">
+        <h1>Particle Trails</h1>
+        <p>Current Shape: <span id="shape-name" class="status">Loading...</span></p>
+        <p>Move hand quickly to see the trail effect!</p>
+    </div>
+
+    <div id="video-container">
+        <video class="input_video"></video>
+    </div>
+    <div id="canvas-container"></div>
+
+<script>
+    // --- Configuration ---
+    const PARTICLE_COUNT = 1200;
+    const SHAPE_CYCLE_DURATION = 5000;
+    
+    // --- State ---
+    let targetPosition = new THREE.Vector3(0, 0, 0); // Where the hand is now
+    let trailPositions = []; // History of hand positions for the trail
+    const TRAIL_LENGTH = 20; // How many history points to keep
+    
+    let pinchDistance = 0;
+    let isHandPresent = false;
+    let currentShapeIndex = 0;
+    let time = 0;
+
+    // --- Texture Generator (Same as before) ---
+    function createTexture(type) {
+        const size = 128;
+        const canvas = document.createElement('canvas');
+        canvas.width = size;
+        canvas.height = size;
+        const ctx = canvas.getContext('2d');
+        const center = size / 2;
+
+        ctx.clearRect(0, 0, size, size);
+        
+        if (type === 'firework') {
+            const grad = ctx.createRadialGradient(center, center, 0, center, center, size/2);
+            grad.addColorStop(0, 'rgba(255, 255, 255, 1)');
+            grad.addColorStop(0.5, 'rgba(255, 255, 255, 0.2)');
+            grad.addColorStop(1, 'rgba(0, 0, 0, 0)');
+            ctx.fillStyle = grad;
+            ctx.fillRect(0,0,size,size);
+        } else if (type === 'heart') {
+            ctx.fillStyle = '#FFFFFF';
+            ctx.beginPath();
+            ctx.moveTo(center, center + 30);
+            ctx.bezierCurveTo(center + 50, center - 30, center + 50, center - 60, center, center - 40);
+            ctx.bezierCurveTo(center - 50, center - 60, center - 50, center - 30, center, center + 30);
+            ctx.fill();
+        } else if (type === 'flower') {
+            ctx.fillStyle = '#FFFFFF';
+            for (let i = 0; i < 6; i++) {
+                ctx.beginPath();
+                const angle = (i * Math.PI) / 3;
+                const x = center + Math.cos(angle) * 20;
+                const y = center + Math.sin(angle) * 20;
+                ctx.arc(x, y, 20, 0, Math.PI * 2);
+                ctx.fill();
+            }
+            ctx.beginPath(); ctx.arc(center, center, 10, 0, Math.PI * 2); ctx.fill();
+        } else if (type === 'saturn') {
+             ctx.fillStyle = '#FFFFFF';
+            ctx.beginPath(); ctx.arc(center, center, 15, 0, Math.PI * 2); ctx.fill();
+            ctx.beginPath(); ctx.ellipse(center, center, 35, 10, Math.PI / 6, 0, Math.PI * 2);
+            ctx.lineWidth = 4; ctx.strokeStyle = 'white'; ctx.stroke();
+        }
+        return new THREE.CanvasTexture(canvas);
+    }
+
+    // --- Three.js Setup ---
+    const container = document.getElementById('canvas-container');
+    const scene = new THREE.Scene();
+    scene.fog = new THREE.FogExp2(0x050505, 0.002);
+
+    const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+    camera.position.z = 50;
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(window.devicePixelRatio);
+    container.appendChild(renderer.domElement);
+
+    // --- Particle System ---
+    const shapes = [
+        { id: 'firework', name: 'Cosmic Dust', color: 0x00ffff, texture: createTexture('firework') },
+        { id: 'heart', name: 'Love Hearts', color: 0xff0055, texture: createTexture('heart') },
+        { id: 'flower', name: 'Garden Bloom', color: 0xffaa00, texture: createTexture('flower') },
+        { id: 'saturn', name: 'Saturn Rings', color: 0xaa00ff, texture: createTexture('saturn') }
+    ];
+
+    let geometry = new THREE.BufferGeometry();
+    let positions = [];
+    let particleData = []; // Store velocity/offset per particle
+    let colors = [];
+
+    // Initialize Particles
+    for (let i = 0; i < PARTICLE_COUNT; i++) {
+        positions.push((Math.random() - 0.5) * 100, (Math.random() - 0.5) * 100, (Math.random() - 0.5) * 50);
+        colors.push(1, 1, 1);
+        
+        // Each particle gets a random offset and an "assigned" index in the trail
+        particleData.push({
+            vx: 0, vy: 0, vz: 0,
+            offsetX: (Math.random() - 0.5) * 10,
+            offsetY: (Math.random() - 0.5) * 10,
+            trailIndex: Math.floor(Math.random() * TRAIL_LENGTH) // Which part of the trail to follow
+        });
+    }
+
+    geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+    geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+
+    let material = new THREE.PointsMaterial({
+        size: 2.0,
+        map: shapes[0].texture,
+        transparent: true,
+        opacity: 0.8,
+        vertexColors: true,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false
+    });
+
+    const particles = new THREE.Points(geometry, material);
+    scene.add(particles);
+
+    // --- Animation Loop ---
+    function animate() {
+        requestAnimationFrame(animate);
+        time += 0.01;
+
+        // Update Trail Logic
+        if (isHandPresent) {
+            // Add current position to start of array
+            trailPositions.unshift(targetPosition.clone());
+        } else {
+            // wander aimlessly if no hand
+             trailPositions.unshift(new THREE.Vector3(
+                 Math.sin(time)*30, Math.cos(time * 0.5)*20, 0
+             ));
+        }
+        
+        // Keep array size fixed
+        if (trailPositions.length > TRAIL_LENGTH) {
+            trailPositions.pop();
+        }
+
+        const posAttr = geometry.attributes.position;
+        const colAttr = geometry.attributes.color;
+
+        let expansionFactor = 1.0 + (pinchDistance * 5.0);
+
+        for (let i = 0; i < PARTICLE_COUNT; i++) {
+            let px = posAttr.getX(i);
+            let py = posAttr.getY(i);
+            let pz = posAttr.getZ(i);
+
+            // Get this particle's assigned target from the trail history
+            // If the trail isn't long enough yet, default to the first position
+            let targetIndex = particleData[i].trailIndex;
+            if (targetIndex >= trailPositions.length) targetIndex = trailPositions.length - 1;
+            
+            // If no trail (start up), just use 0,0,0
+            let target = (trailPositions.length > 0) ? trailPositions[targetIndex] : new THREE.Vector3(0,0,0);
+
+            // Calculate destination with random offset (cloud effect)
+            let destX = target.x + particleData[i].offsetX * expansionFactor;
+            let destY = target.y + particleData[i].offsetY * expansionFactor;
+            let destZ = target.z;
+
+            // Physics: Ease towards destination
+            // We use a simple lerp for "following" behavior
+            // "0.08" is the speed. Higher = tighter tracking. Lower = lazier/floatier.
+            px += (destX - px) * 0.08;
+            py += (destY - py) * 0.08;
+            pz += (destZ - pz) * 0.08;
+            
+            // Add slight sine wave noise for life
+            px += Math.sin(time * 5 + i) * 0.05;
+            py += Math.cos(time * 3 + i) * 0.05;
+
+            posAttr.setXYZ(i, px, py, pz);
+        }
+
+        posAttr.needsUpdate = true;
+
+        // Shape Switching
+        const shapeIndex = Math.floor((Date.now() / SHAPE_CYCLE_DURATION) % shapes.length);
+        if (shapeIndex !== currentShapeIndex) {
+            currentShapeIndex = shapeIndex;
+            const shapeData = shapes[currentShapeIndex];
+            material.map = shapeData.texture;
+            document.getElementById('shape-name').innerText = shapeData.name;
+            
+            // Recolor
+            const c = new THREE.Color(shapeData.color);
+            for(let i=0; i<PARTICLE_COUNT; i++) {
+                 colAttr.setXYZ(i, c.r, c.g, c.b);
+            }
+            colAttr.needsUpdate = true;
+        }
+
+        renderer.render(scene, camera);
+    }
+
+    // --- Hand Tracking ---
+    const videoElement = document.querySelector('.input_video');
+    
+    function onResults(results) {
+        if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+            isHandPresent = true;
+            const lm = results.multiHandLandmarks[0];
+            
+            // Map 0..1 to Screen Coordinates
+            // -40 to 40 seems to fit well with z=50 camera
+            const x = -(lm[9].x - 0.5) * 50; 
+            const y = -(lm[9].y - 0.5) * 40;
+            
+            targetPosition.set(x, y, 0);
+
+            // Pinch
+            const dist = Math.sqrt(
+                Math.pow(lm[4].x - lm[8].x, 2) + Math.pow(lm[4].y - lm[8].y, 2)
+            );
+            pinchDistance = dist;
+        } else {
+            isHandPresent = false;
+        }
+    }
+
+    const hands = new Hands({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`});
+    hands.setOptions({ maxNumHands: 1, modelComplexity: 1, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5 });
+    hands.onResults(onResults);
+
+    const cameraUtils = new Camera(videoElement, {
+        onFrame: async () => { await hands.send({image: videoElement}); },
+        width: 640, height: 480
+    });
+    cameraUtils.start();
+
+    // Resize Handler
+    window.addEventListener('resize', () => {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+    
+    // Init trail with zeros
+    for(let i=0; i<TRAIL_LENGTH; i++) trailPositions.push(new THREE.Vector3(0,0,0));
+
+    animate();
+</script>
+</body>
+</html>
